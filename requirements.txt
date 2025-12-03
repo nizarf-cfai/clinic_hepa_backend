@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+websockets
+google-genai
+python-dotenv
+google-auth
+requests
