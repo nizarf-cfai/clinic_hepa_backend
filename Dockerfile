@@ -1,19 +1,21 @@
-# Use official lightweight Python image
 FROM python:3.11-slim
 
-# Set working directory
+# Install system dependencies required for some python packages
+# (We shouldn't need audio libs, but this prevents some build errors)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Copy requirements and install dependencies
+# Copy requirements first to leverage Docker cache
 COPY requirements.txt .
+
+# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
+# Copy the rest of the application
 COPY . .
 
-# Expose the port
-EXPOSE 8080
-
-# Command to run the application using Uvicorn
-# Cloud Run expects the app to listen on the PORT environment variable (default 8080)
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]
+# Cloud Run expects the app to listen on the $PORT environment variable
+CMD exec uvicorn server:app --host 0.0.0.0 --port ${PORT:-8080}
