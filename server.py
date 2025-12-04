@@ -234,9 +234,10 @@ class AdvisorAgent:
             )
             result = json.loads(response.text)
             if result.get("end_conversation"):
-                return "Thank the patient and end the call.", result.get("reasoning"), True
+                result['question'] = "Thank the patient and end the call."
+                return result
             else:
-                return result.get("question"), result.get("reasoning"), False
+                return result
         except Exception as e:
             logger.error(f"Advisor Error: {e}")
             return "Continue.", "Error", False
@@ -437,13 +438,20 @@ class SimulationManager:
                     })
 
                     # C. Advisor Decision
-                    question, reasoning, status = await self.advisor.get_advise(self.history, q_list)
+                    advisor_result = await self.advisor.get_advise(self.history, q_list)
                     
                     # >> STREAM ADVISOR THOUGHTS (Optional, reusing system type or creating new)
                     await self.websocket.send_json({
                         "type": "system",
                         "message": f"Logic: {reasoning}"
                     })
+
+                    question = advisor_result.get('question')
+                    status = advisor_result.get('end_conversation')
+                    reasoning = advisor_result.get('reasoning')
+                    asked_qid = advisor_result.get('qid')
+
+                    self.qm.update_ranking(asked_qid, "asked")
 
                     next_instruction = question
                     interview_end = status
