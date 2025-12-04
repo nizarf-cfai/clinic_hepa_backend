@@ -1,0 +1,46 @@
+[
+    {
+        "role" : "nurse",
+        "content" : "What brings you in today?",
+        "qid" : "00001",
+        "score" : 9,
+        "rank" : 2,
+        "status" : null
+    },
+    {
+        "role" : "nurse",
+        "content" : "Confirm Patient Name and Date of Birth",
+        "qid" : "00003",
+        "score" : 10,
+        "rank" : 1,
+        "status" : null
+
+    },
+    {
+        "role" : "nurse",
+        "content" : "Current Medications",
+        "qid" : "00004",
+        "score" : 8,
+        "rank" : 3,
+        "status" : null
+
+    },
+    {
+        "role" : "nurse",
+        "content" : "Drug Allergies",
+        "qid" : "00005",
+        "score" : 7,
+        "rank" : 4,
+        "status" : null
+
+    },
+    {
+        "role" : "nurse",
+        "content" : "Past Surgeries",
+        "qid" : "00006",
+        "score" : 6,
+        "rank" : 5,
+        "status" : null
+
+    }
+]
