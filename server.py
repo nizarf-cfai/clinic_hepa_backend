@@ -17,7 +17,7 @@ import diagnosis_manager
 
 import google.auth.transport.requests
 import google.auth.transport.grpc 
-
+import traceback
 # Configure logging for Cloud Run
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("medforce-backend")
@@ -444,7 +444,7 @@ class SimulationManager:
                     reasoning = advisor_result.get('reasoning')
                     asked_qid = advisor_result.get('qid')
 
-                    self.qm.update_ranking(asked_qid, "asked")
+                    self.qm.update_status(asked_qid, "asked")
                     # >> STREAM ADVISOR THOUGHTS (Optional, reusing system type or creating new)
                     await self.websocket.send_json({
                         "type": "system",
