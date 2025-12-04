@@ -439,19 +439,19 @@ class SimulationManager:
 
                     # C. Advisor Decision
                     advisor_result = await self.advisor.get_advise(self.history, q_list)
-                    
-                    # >> STREAM ADVISOR THOUGHTS (Optional, reusing system type or creating new)
-                    await self.websocket.send_json({
-                        "type": "system",
-                        "message": f"Logic: {reasoning}"
-                    })
-
                     question = advisor_result.get('question')
                     status = advisor_result.get('end_conversation')
                     reasoning = advisor_result.get('reasoning')
                     asked_qid = advisor_result.get('qid')
 
                     self.qm.update_ranking(asked_qid, "asked")
+                    # >> STREAM ADVISOR THOUGHTS (Optional, reusing system type or creating new)
+                    await self.websocket.send_json({
+                        "type": "system",
+                        "message": f"Logic: {reasoning}"
+                    })
+
+                    
 
                     next_instruction = question
                     interview_end = status
