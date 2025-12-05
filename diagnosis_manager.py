@@ -7,35 +7,89 @@ class DiagnosisManager:
             high_threshold: Count required for 'High' probability.
             min_threshold: Count required for 'Medium'. Anything below this is 'Low'.
         """
+        # Main recursive diagnosis pool
         self.diagnoses: List[Dict[str, Any]] = []
+        
+        # Consolidated diagnosis pool (Separate list for refined/merged results)
+        self.consolidated_diagnoses: List[Dict[str, Any]] = []
+        
         self.high_threshold = high_threshold
         self.min_threshold = min_threshold
 
     # ---------------------------------------------------------
-    # DATA RETRIEVAL FUNCTIONS
+    # CONSOLIDATED DIAGNOSIS FUNCTIONS
+    # ---------------------------------------------------------
+    def set_consolidated_diagnoses(self, raw_list: List[Dict[str, Any]]):
+        """
+        Accepts a list of diagnosis objects, calculates metrics, and stores them.
+        """
+        processed_list = []
+        
+        for item in raw_list:
+            clean_item = {
+                "did": item.get("did"),
+                "diagnosis": item.get("diagnosis"),
+                "indicators_point": item.get("indicators_point", [])
+            }
+            
+            # Calculate count and probability
+            self._recalculate_metrics(clean_item)
+            processed_list.append(clean_item)
+
+        # Sort by probability (High -> Low)
+        priority_map = {"High": 3, "Medium": 2, "Low": 1}
+        self.consolidated_diagnoses = sorted(
+            processed_list, 
+            key=lambda x: (priority_map.get(x["probability"], 0), x["indicators_count"]), 
+            reverse=True
+        )
+
+    def get_consolidated_diagnoses(self) -> List[Dict[str, Any]]:
+        """Returns the full consolidated list with metrics."""
+        return self.consolidated_diagnoses
+
+    def get_consolidated_diagnoses_basic(self) -> List[Dict[str, Any]]:
+        """
+        Returns the consolidated list EXCLUDING 'indicators_count' and 'probability'.
+        Keys returned: did, diagnosis, indicators_point.
+        """
+        simplified_list = []
+        for item in self.consolidated_diagnoses:
+            simplified_list.append({
+                "did": item["did"],
+                "diagnosis": item["diagnosis"],
+                "indicators_point": item["indicators_point"]
+            })
+        return simplified_list
+
+    # ---------------------------------------------------------
+    # MAIN POOL FUNCTIONS
     # ---------------------------------------------------------
     def get_diagnosis_sum(self) -> List[Dict[str, Any]]:
-        """
-        Returns the WHOLE data object (all keys), sorted by probability.
-        """
+        """Returns the WHOLE data object from main pool."""
         return self._get_sorted_list()
 
     def get_diagnosis_basic(self) -> List[Dict[str, Any]]:
-        """
-        Returns a simplified list EXCLUDING 'indicators_point' and 'probability'.
-        Useful for UI dropdowns or summaries where details aren't needed.
-        """
+        """Returns main pool excluding 'indicators_point' and 'probability'."""
         full_list = self._get_sorted_list()
         simplified_list = []
-        
         for item in full_list:
             simplified_list.append({
                 "did": item["did"],
                 "diagnosis": item["diagnosis"],
                 "indicators_point": item["indicators_point"] 
-                # Note: indicators_point and probability are EXCLUDED here
             })
-            
+        return simplified_list
+
+    def get_diagnosis_normal(self) -> List[Dict[str, Any]]:
+        """Returns main pool with diagnosis and points only."""
+        full_list = self._get_sorted_list()
+        simplified_list = []
+        for item in full_list:
+            simplified_list.append({
+                "diagnosis": item["diagnosis"],
+                "indicators_point": item["indicators_point"] 
+            })
         return simplified_list
 
     # ---------------------------------------------------------
@@ -43,31 +97,19 @@ class DiagnosisManager:
     # ---------------------------------------------------------
     def update_diagnoses(self, new_data: List[Dict[str, Any]]):
         """
-        Merges new diagnosis data into existing records.
-        - Adds new indicators to the existing list (UNION).
-        - Does NOT overwrite existing indicators.
-        - Removes duplicates automatically.
+        Merges new diagnosis data into existing records (Recursive Pool).
         """
         for new_item in new_data:
             target_did = new_item.get("did")
             existing_item = self._find_by_did(target_did)
 
             if existing_item:
-                # 1. Get existing points (default to empty list if missing)
                 current_points = set(existing_item.get("indicators_point", []))
-                
-                # 2. Get new points
                 new_points = set(new_item.get("indicators_point", []))
-                
-                # 3. Merge: Union keeps all unique items from both sets
                 merged_points = list(current_points.union(new_points))
-                
-                # 4. Update the object
                 existing_item["indicators_point"] = merged_points
                 self._recalculate_metrics(existing_item)
-                
             else:
-                # Add new diagnosis entirely
                 clean_item = {
                     "diagnosis": new_item["diagnosis"],
                     "did": new_item["did"],
@@ -80,7 +122,6 @@ class DiagnosisManager:
     # HELPERS
     # ---------------------------------------------------------
     def _find_by_did(self, did: str) -> Union[Dict, None]:
-        """Find a diagnosis object by its ID."""
         for item in self.diagnoses:
             if item["did"] == did:
                 return item
@@ -93,7 +134,6 @@ class DiagnosisManager:
         count = len(item["indicators_point"])
         item["indicators_count"] = count
 
-        # New logic:
         # 0–3  -> Low
         # 4–5  -> Medium
         # >=6  -> High
@@ -101,11 +141,11 @@ class DiagnosisManager:
             item["probability"] = "Low"
         elif 4 <= count <= 5:
             item["probability"] = "Medium"
-        else:  # count >= 6
+        else:
             item["probability"] = "High"
 
     def _get_sorted_list(self) -> List[Dict]:
-        """Helper to return list sorted by Importance (High > Med > Low)."""
+        """Helper to return list sorted by Importance."""
         priority_map = {"High": 3, "Medium": 2, "Low": 1}
         return sorted(
             self.diagnoses, 
@@ -119,34 +159,21 @@ class DiagnosisManager:
 if __name__ == "__main__":
     import json
 
-    # 1. Initialize
-    dm = DiagnosisManager(high_threshold=5, min_threshold=3)
+    dm = DiagnosisManager()
 
-    # 2. First Update (Initial Analysis)
-    input_batch_1 = [
+    # Input from Agent
+    agent_output = [
         {
-            "diagnosis": "Angina",
-            "did": "A001",
-            "indicators_point": ["Chest Pain", "Shortness of Breath"]
+            "did": "D1", 
+            "diagnosis": "Influenza A", 
+            "indicators_point": ["Fever", "Cough", "Body Ache", "Chills"]
         }
     ]
-    dm.update_diagnoses(input_batch_1)
-    
-    print("--- State 1 (Initial) ---")
-    print(json.dumps(dm.get_diagnosis_sum(), indent=2))
 
-    # 3. Second Update (New info found)
-    # NOTICE: "Chest Pain" is repeated. "Arm Numbness" is new.
-    input_batch_2 = [
-        {
-            "diagnosis": "Angina",
-            "did": "A001",
-            "indicators_point": ["Chest Pain", "Arm Numbness"] 
-        }
-    ]
-    
-    dm.update_diagnoses(input_batch_2)
+    # Set Data
+    dm.set_consolidated_diagnoses(agent_output)
 
-    print("\n--- State 2 (Merged - Check indicators_point) ---")
-    # Expected: 3 items ["Chest Pain", "Shortness of Breath", "Arm Numbness"]
-    print(json.dumps(dm.get_diagnosis_sum(), indent=2))
+    # Get Basic Consolidated (No probability/count)
+    result = dm.get_consolidated_diagnoses_basic()
+    
+    print(json.dumps(result, indent=2))
