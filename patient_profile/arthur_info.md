@@ -8,3 +8,4 @@ Primary phone number: 937-555-4821 (Sarah Pendelton – wife)
 Emergency contact: Sarah Pendelton – 937-555-4821 (wife)
 Clinic/department: Hepatology Clinic (Liver Specialist)
 Visit type: New patient (first visit)
+Chief Complaint : Upper right abdominal pain for the past three days.

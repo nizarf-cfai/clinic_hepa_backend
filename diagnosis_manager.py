@@ -46,7 +46,11 @@ class DiagnosisManager:
 
     def get_consolidated_diagnoses(self) -> List[Dict[str, Any]]:
         """Returns the full consolidated list with metrics."""
-        return self.consolidated_diagnoses
+        ranked_d = []
+        for i,d in enumerate(self.consolidated_diagnoses):
+            d['rank'] = i+1
+            ranked_d.append(d)
+        return ranked_d
 
     def get_consolidated_diagnoses_basic(self) -> List[Dict[str, Any]]:
         """

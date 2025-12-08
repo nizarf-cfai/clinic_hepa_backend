@@ -69,7 +69,7 @@ except Exception as e:
     PATIENT_PROMPT = "You are a patient."
 
 # ==========================================
-# LOGIC AGENTS (Ported from live_session_manager2)
+# LOGIC AGENTS
 # ==========================================
 
 class QuestionRankingAgent:
@@ -187,7 +187,7 @@ class AnswerHighlighterAgent:
         except: return []
 
 # ==========================================
-# THREADING & HISTORY
+# THREADING & HISTORY MANAGER
 # ==========================================
 
 class TranscriptManager:
@@ -204,44 +204,58 @@ class TranscriptManager:
         return self.history
 
 class ClinicalLogicThread(threading.Thread):
-    def __init__(self, transcript_manager, qm, diagnosis_manager, shared_state):
+    def __init__(self, transcript_manager, qm, dm, shared_state, main_loop, websocket, agents):
         super().__init__()
         self.tm = transcript_manager
         self.qm = qm
-        self.dm = diagnosis_manager
+        self.dm = dm
         self.shared_state = shared_state
+        self.main_loop = main_loop 
+        self.websocket = websocket
+        
+        # Agents are now passed in, not created here
+        self.trigger = agents['trigger']
+        self.diagnoser = agents['diagnoser']
+        self.evaluator = agents['evaluator']
+        self.ranker = agents['ranker']
+        
         self.running = True
         self.daemon = True 
 
     def run(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
-        self.trigger_agent = DiagnosisTriggerAgent()
-        self.diagnoser = DiagnoseAgent()
-        self.evaluator = DiagnoseEvaluatorAgent()
-        self.ranker = QuestionRankingAgent()
-
         logger.info("🩺 Logic Thread Started")
         loop.run_until_complete(self._monitor_loop())
+
+    async def _push_update(self, type_str, data):
+        if self.websocket and self.main_loop and not self.websocket.client_state.name == "DISCONNECTED":
+            future = asyncio.run_coroutine_threadsafe(
+                self.websocket.send_json({"type": type_str, "data": data}),
+                self.main_loop
+            )
+            try:
+                future.result(timeout=1) 
+            except:
+                pass
 
     async def _monitor_loop(self):
         while self.running:
             try:
-                current_cycle = self.shared_state.get("cycle", 0)
-                # Run logic every 3rd turn to simulate periodic review
-                if (current_cycle % 3) == 0:
-                    history = copy.deepcopy(self.tm.get_history())
-                    should_run, reason = await self.trigger_agent.check_trigger(history)
+                # Regular Monitoring Loop (Cycle based)
+                # This only runs AFTER initialization is done by main thread
+                history = copy.deepcopy(self.tm.get_history())
+                
+                # Wait until there is actual conversation history
+                if len(history) > 0:
+                    should_run, reason = await self.trigger.check_trigger(history)
 
                     if should_run:
                         logger.info(f"⚡ Diagnosis Triggered: {reason}")
                         
-                        # 1. Diagnose
                         diag_res = await self.diagnoser.get_diagnosis_update(history, self.dm.get_diagnosis_basic())
                         self.dm.update_diagnoses(diag_res.get("diagnosis_list"))
                         
-                        # 2. Evaluate & Merge
                         merged_diag = await self.evaluator.evaluate_diagnoses(
                             self.dm.get_consolidated_diagnoses_basic(),
                             diag_res.get("diagnosis_list"), 
@@ -249,19 +263,17 @@ class ClinicalLogicThread(threading.Thread):
                         )
                         self.dm.set_consolidated_diagnoses(merged_diag)
                         
-                        # 3. Update Questions
                         self.qm.add_questions_from_text(diag_res.get("follow_up_questions"))
                         diag_stream = self.dm.get_consolidated_diagnoses()
                         q_list = self.qm.get_recommend_question()
                         
-                        # 4. Rank
                         ranked_q = await self.ranker.rank_questions(history, diag_stream, q_list)
                         self.qm.update_ranking(ranked_q)
 
-                        # 5. Update State for Frontend
+                        await self._push_update("diagnosis", diag_stream)
+                        await self._push_update("questions", self.qm.get_questions())
+                        
                         self.shared_state["ranked_questions"] = self.qm.get_recommend_question()
-                        self.shared_state["diagnosis_data"] = diag_stream
-                        self.shared_state["data_ready"] = True
                         
             except Exception as e:
                 logger.error(f"Logic Thread Error: {e}")
@@ -295,9 +307,14 @@ class TextBridgeAgent:
     def set_session(self, session):
         self.session = session
 
-    async def speak_and_stream(self, text_input, websocket: WebSocket):
-        if not self.session: return None
-        await self.session.send(input=text_input, end_of_turn=True)
+    async def speak_and_stream(self, text_input, websocket: WebSocket, highlighter=None, diagnosis_context=None):
+        if not self.session: return None, []
+        
+        try:
+            await self.session.send(input=text_input, end_of_turn=True)
+        except Exception:
+            return None, []
+
         text_accumulator = []
         
         try:
@@ -314,22 +331,40 @@ class TextBridgeAgent:
                 if response.server_content and response.server_content.turn_complete:
                     full_text = "".join(text_accumulator).strip()
                     if full_text:
-                        # We send transcript here, but the Manager handles logging
-                        await websocket.send_json({"type": "transcript", "speaker": self.name, "text": full_text})
-                        return full_text
-                    return "[...]"
-            return None
+                        highlights = []
+                        if highlighter and diagnosis_context:
+                            try:
+                                highlights = await highlighter.highlight_text(full_text, diagnosis_context)
+                            except: pass
+
+                        await websocket.send_json({
+                            "type": "transcript",
+                            "speaker": self.name,
+                            "text": full_text,
+                            "highlights": highlights
+                        })
+                        return full_text, highlights
+                    return "[...]", []
+            return None, []
         except Exception as e:
             logger.error(f"Stream Error ({self.name}): {e}")
-            return None
+            return None, []
 
 class SimulationManager:
     def __init__(self, websocket: WebSocket):
         self.websocket = websocket
+        
+        # Voice Agents
         self.nurse = TextBridgeAgent("NURSE", NURSE_PROMPT, "Aoede")
         self.patient = TextBridgeAgent("PATIENT", PATIENT_PROMPT, "Puck")
+        
+        # Logic Agents (Instantiated here to use in Init Phase)
         self.advisor = AdvisorAgent()
         self.highlighter = AnswerHighlighterAgent()
+        self.trigger = DiagnosisTriggerAgent()
+        self.diagnoser = DiagnoseAgent()
+        self.evaluator = DiagnoseEvaluatorAgent()
+        self.ranker = QuestionRankingAgent()
         
         self.tm = TranscriptManager()
         self.qm = question_manager.QuestionPoolManager(QUESTION_LIST)
@@ -338,39 +373,82 @@ class SimulationManager:
         self.cycle = 0
         self.shared_state = {
             "ranked_questions": self.qm.get_recommend_question(),
-            "diagnosis_data": [],
-            "cycle": 0,
-            "data_ready": False
+            "cycle": 0
         }
         self.running = False
 
     async def run(self):
         self.running = True
-        await self.websocket.send_json({"type": "system", "message": "Initializing..."})
+        await self.websocket.send_json({"type": "system", "message": "Initializing Agents..."})
 
-        # Start Logic Thread
-        logic_thread = ClinicalLogicThread(self.tm, self.qm, self.dm, self.shared_state)
+        # --- INITIALIZATION PHASE ---
+        try:
+            await self.websocket.send_json({"type": "system", "message": "Running Initial Diagnosis..."})
+            logger.info("⚡ Running Initial Logic...")
+            
+            # Fake history from static profile
+            initial_history = [{"speaker": "PATIENT_INFO", "text": PATIENT_PROFILE_TEXT}]
+
+            # 1. Diagnose
+            diag_res = await self.diagnoser.get_diagnosis_update(initial_history, self.dm.get_diagnosis_basic())
+            self.dm.update_diagnoses(diag_res.get("diagnosis_list"))
+            
+            # 2. Evaluate
+            merged_diag = await self.evaluator.evaluate_diagnoses(
+                self.dm.get_consolidated_diagnoses_basic(),
+                diag_res.get("diagnosis_list"), 
+                initial_history
+            )
+            self.dm.set_consolidated_diagnoses(merged_diag)
+            
+            # 3. Questions
+            self.qm.add_questions_from_text(diag_res.get("follow_up_questions"))
+            diag_stream = self.dm.get_consolidated_diagnoses()
+            q_list = self.qm.get_recommend_question()
+            
+            # 4. Rank
+            ranked_q = await self.ranker.rank_questions(initial_history, diag_stream, q_list)
+            self.qm.update_ranking(ranked_q)
+
+            # 5. Push Updates
+            self.shared_state["ranked_questions"] = self.qm.get_recommend_question()
+            await self.websocket.send_json({"type": "diagnosis", "data": diag_stream})
+            await self.websocket.send_json({"type": "questions", "data": self.qm.get_questions()})
+            logger.info("✅ Init Logic Complete")
+
+        except Exception as e:
+            logger.error(f"Init Error: {e}")
+            await self.websocket.send_json({"type": "system", "message": "Init Error, proceeding..."})
+
+        # --- START BACKGROUND MONITORING ---
+        agents_bundle = {
+            'trigger': self.trigger, 'diagnoser': self.diagnoser,
+            'evaluator': self.evaluator, 'ranker': self.ranker
+        }
+        logic_thread = ClinicalLogicThread(
+            self.tm, self.qm, self.dm, self.shared_state, 
+            asyncio.get_running_loop(), self.websocket, agents_bundle
+        )
         logic_thread.start()
 
+        # --- START VOICE LOOPS ---
         async with contextlib.AsyncExitStack() as stack:
             self.nurse.set_session(await stack.enter_async_context(self.nurse.get_connection_context()))
             self.patient.set_session(await stack.enter_async_context(self.patient.get_connection_context()))
-            await self.websocket.send_json({"type": "system", "message": "Connected. Starting Assessment."})
+            await self.websocket.send_json({"type": "system", "message": "Starting Assessment."})
 
-            next_instruction = "Introduce yourself and ask for Name and DOB."
+            next_instruction = "Introduce yourself and tell the patient will asked health condition."
             patient_last_words = "Hello."
             interview_end = False
 
             while self.running:
                 self.shared_state["cycle"] = self.cycle 
 
-                # --- 1. NURSE TURN ---
+                # --- 1. NURSE ---
                 nurse_input = f"Patient said: '{patient_last_words}'\n[SUPERVISOR: {next_instruction}]"
-                nurse_text = await self.nurse.speak_and_stream(nurse_input, self.websocket)
+                nurse_text, _ = await self.nurse.speak_and_stream(nurse_input, self.websocket)
                 
-                if not nurse_text:
-                    nurse_text = "[The nurse waits]"
-                
+                if not nurse_text: nurse_text = "[The nurse waits]"
                 self.tm.log("NURSE", nurse_text)
 
                 if "doctor" in next_instruction.lower() and "bye" in nurse_text.lower():
@@ -379,17 +457,17 @@ class SimulationManager:
 
                 await asyncio.sleep(0.5)
 
-                # --- 2. PATIENT TURN ---
-                patient_text = await self.patient.speak_and_stream(nurse_text, self.websocket)
+                # --- 2. PATIENT ---
+                current_diagnosis_context = self.dm.get_consolidated_diagnoses_basic()
+                patient_text, highlight_result = await self.patient.speak_and_stream(
+                    nurse_text, 
+                    self.websocket, 
+                    highlighter=self.highlighter, 
+                    diagnosis_context=current_diagnosis_context
+                )
                 
-                highlight_result = []
                 if patient_text:
                     patient_last_words = patient_text
-                    # Highlight analysis
-                    highlight_result = await self.highlighter.highlight_text(patient_text, self.dm.get_consolidated_diagnoses_basic())
-                    # Send highlights to frontend
-                    if highlight_result:
-                        await self.websocket.send_json({"type": "highlights", "data": highlight_result})
                 else:
                     patient_text = "[The patient nods]"
                     patient_last_words = "(Silent)"
@@ -399,15 +477,8 @@ class SimulationManager:
 
                 if interview_end: break
 
-                # --- 3. ADVISOR & DATA SYNC ---
+                # --- 3. ADVISOR ---
                 try:
-                    # Check if thread updated data
-                    if self.shared_state.get("data_ready"):
-                        await self.websocket.send_json({"type": "diagnosis", "data": self.shared_state["diagnosis_data"]})
-                        await self.websocket.send_json({"type": "questions", "data": self.qm.get_questions()}) # Send full list for UI
-                        self.shared_state["data_ready"] = False
-
-                    # Advisor decides next move (fast logic)
                     current_ranked = self.shared_state["ranked_questions"]
                     question, reasoning, status, qid = await self.advisor.get_advise(self.tm.get_history(), current_ranked)
                     
@@ -420,7 +491,7 @@ class SimulationManager:
                     self.cycle += 1
 
                 except Exception as e:
-                    logger.error(f"Main Loop Logic Error: {e}")
+                    logger.error(f"Loop Logic Error: {e}")
                     next_instruction = "Continue assessment."
 
                 if self.websocket.client_state.name == "DISCONNECTED": break
