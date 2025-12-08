@@ -125,3 +125,10 @@ class QuestionPoolManager:
                 q["status"] = new_status
                 return True
         return False
+    
+    def update_answer(self, qid: str, answer: str) -> bool:
+        for q in self.questions:
+            if q["qid"] == qid:
+                q["answer"] = answer
+                return True
+        return False

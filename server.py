@@ -7,6 +7,7 @@ import logging
 import datetime
 import threading
 import copy
+import uuid 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
@@ -72,9 +73,13 @@ except Exception as e:
 # LOGIC AGENTS
 # ==========================================
 
-class QuestionRankingAgent:
+class BaseLogicAgent:
     def __init__(self):
         self.client = genai.Client(vertexai=True, project=os.getenv("PROJECT_ID"), location=os.getenv("PROJECT_LOCATION", "us-central1"))
+
+class QuestionRankingAgent(BaseLogicAgent):
+    def __init__(self):
+        super().__init__()
         self.response_schema = {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"rank": { "type": "INTEGER" }, "qid": { "type": "STRING" }}, "required": ["rank", "qid"]}}
         try:
             with open("patient_profile/q_ranker.md", "r", encoding="utf-8") as f: self.system_instruction = f.read()
@@ -92,9 +97,9 @@ class QuestionRankingAgent:
             logger.error(f"Ranker Error: {e}")
             return [{"rank": i+1, "qid": q["qid"]} for i, q in enumerate(q_list)]
 
-class DiagnosisTriggerAgent:
+class DiagnosisTriggerAgent(BaseLogicAgent):
     def __init__(self):
-        self.client = genai.Client(vertexai=True, project=os.getenv("PROJECT_ID"), location=os.getenv("PROJECT_LOCATION", "us-central1"))
+        super().__init__()
         self.response_schema = {"type": "OBJECT", "properties": {"should_run": { "type": "BOOLEAN" }, "reason": { "type": "STRING" }}, "required": ["should_run", "reason"]}
         try:
             with open("patient_profile/diagnosis_trigger.md", "r", encoding="utf-8") as f: self.system_instruction = f.read()
@@ -111,9 +116,9 @@ class DiagnosisTriggerAgent:
             return res.get("should_run", False), res.get("reason", "")
         except: return True, "Fallback"
 
-class DiagnoseEvaluatorAgent:
+class DiagnoseEvaluatorAgent(BaseLogicAgent):
     def __init__(self):
-        self.client = genai.Client(vertexai=True, project=os.getenv("PROJECT_ID"), location=os.getenv("PROJECT_LOCATION", "us-central1"))
+        super().__init__()
         self.response_schema = {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"diagnosis": { "type": "STRING" }, "did": { "type": "STRING" }, "indicators_point": { "type": "ARRAY", "items": { "type": "STRING" } }}, "required": ["diagnosis", "did", "indicators_point"]}}
         try:
             with open("patient_profile/diagnosis_eval.md", "r", encoding="utf-8") as f: self.system_instruction = f.read()
@@ -129,9 +134,9 @@ class DiagnoseEvaluatorAgent:
             return json.loads(response.text)
         except: return diagnosis_pool + new_diagnosis_list
 
-class DiagnoseAgent:
+class DiagnoseAgent(BaseLogicAgent):
     def __init__(self):
-        self.client = genai.Client(vertexai=True, project=os.getenv("PROJECT_ID"), location=os.getenv("PROJECT_LOCATION", "us-central1"))
+        super().__init__()
         self.response_schema = {"type": "OBJECT", "properties": {"diagnosis_list": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"diagnosis": { "type": "STRING" }, "did": { "type": "STRING" }, "indicators_point": { "type": "ARRAY", "items": { "type": "STRING" } }}, "required": ["diagnosis", "indicators_point", "did"]}}, "follow_up_questions": {"type": "ARRAY", "items": { "type": "STRING" }}}, "required": ["diagnosis_list", "follow_up_questions"]}
         try:
             with open("patient_profile/diagnoser.md", "r", encoding="utf-8") as f: self.system_instruction = f.read()
@@ -148,9 +153,9 @@ class DiagnoseAgent:
             return {"diagnosis_list": res.get("diagnosis_list", []), "follow_up_questions": res.get("follow_up_questions", [])}
         except: return {"diagnosis_list": current_diagnosis_hypothesis, "follow_up_questions": []}
 
-class AdvisorAgent:
+class AdvisorAgent(BaseLogicAgent):
     def __init__(self):
-        self.client = genai.Client(vertexai=True, project=os.getenv("PROJECT_ID"), location=os.getenv("PROJECT_LOCATION", "us-central1"))
+        super().__init__()
         self.response_schema = {"type": "OBJECT", "properties": {"question": { "type": "STRING" }, "qid": { "type": "STRING" }, "end_conversation": { "type": "BOOLEAN" }, "reasoning": { "type": "STRING" }}, "required": ["question", "end_conversation", "reasoning", "qid"]}
         try:
             with open("patient_profile/advisor_agent.md", "r", encoding="utf-8") as f: self.system_instruction = f.read()
@@ -167,9 +172,9 @@ class AdvisorAgent:
             return res.get("question"), res.get("reasoning"), res.get("end_conversation"), res.get("qid")
         except: return "Continue.", "Error", False, None
 
-class AnswerHighlighterAgent:
+class AnswerHighlighterAgent(BaseLogicAgent):
     def __init__(self):
-        self.client = genai.Client(vertexai=True, project=os.getenv("PROJECT_ID"), location=os.getenv("PROJECT_LOCATION", "us-central1"))
+        super().__init__()
         self.response_schema = {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"level": { "type": "STRING", "enum": ["danger", "warning"] }, "text": { "type": "STRING" }}, "required": ["level", "text"]}}
         try:
             with open("patient_profile/highlight_agent.md", "r", encoding="utf-8") as f: self.system_instruction = f.read()
@@ -204,7 +209,7 @@ class TranscriptManager:
         return self.history
 
 class ClinicalLogicThread(threading.Thread):
-    def __init__(self, transcript_manager, qm, dm, shared_state, main_loop, websocket, agents):
+    def __init__(self, transcript_manager, qm, dm, shared_state, main_loop, websocket):
         super().__init__()
         self.tm = transcript_manager
         self.qm = qm
@@ -213,19 +218,24 @@ class ClinicalLogicThread(threading.Thread):
         self.main_loop = main_loop 
         self.websocket = websocket
         
-        # Agents are now passed in, not created here
-        self.trigger = agents['trigger']
-        self.diagnoser = agents['diagnoser']
-        self.evaluator = agents['evaluator']
-        self.ranker = agents['ranker']
+        # NOTE: Agents are NOT initialized here to avoid binding to the main thread's loop.
+        # They will be initialized in run() -> _monitor_loop()
         
         self.running = True
         self.daemon = True 
 
     def run(self):
+        # Create a new Event Loop for this thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        logger.info("🩺 Logic Thread Started")
+        
+        # --- FIX: INITIALIZE AGENTS HERE (Inside the Thread's Loop) ---
+        self.trigger = DiagnosisTriggerAgent()
+        self.diagnoser = DiagnoseAgent()
+        self.evaluator = DiagnoseEvaluatorAgent()
+        self.ranker = QuestionRankingAgent()
+
+        logger.info("🩺 Logic Thread Started (Agents Initialized)")
         loop.run_until_complete(self._monitor_loop())
 
     async def _push_update(self, type_str, data):
@@ -240,13 +250,47 @@ class ClinicalLogicThread(threading.Thread):
                 pass
 
     async def _monitor_loop(self):
+        # --- INITIALIZATION PHASE ---
+        try:
+            logger.info("⚡ Running Initial Diagnosis (Thread)...")
+            initial_history = [{"speaker": "PATIENT_INFO", "text": PATIENT_PROFILE_TEXT}]
+
+            # 1. Diagnose
+            diag_res = await self.diagnoser.get_diagnosis_update(initial_history, self.dm.get_diagnosis_basic())
+            self.dm.update_diagnoses(diag_res.get("diagnosis_list"))
+            
+            # 2. Evaluate
+            merged_diag = await self.evaluator.evaluate_diagnoses(
+                self.dm.get_consolidated_diagnoses_basic(),
+                diag_res.get("diagnosis_list"), 
+                initial_history
+            )
+            self.dm.set_consolidated_diagnoses(merged_diag)
+            
+            # 3. Questions
+            self.qm.add_questions_from_text(diag_res.get("follow_up_questions"))
+            diag_stream = self.dm.get_consolidated_diagnoses()
+            q_list = self.qm.get_recommend_question()
+            
+            # 4. Rank
+            ranked_q = await self.ranker.rank_questions(initial_history, diag_stream, q_list)
+            self.qm.update_ranking(ranked_q)
+
+            # 5. Push Updates
+            await self._push_update("diagnosis", diag_stream)
+            await self._push_update("questions", self.qm.get_questions())
+            
+            self.shared_state["ranked_questions"] = self.qm.get_recommend_question()
+            logger.info("✅ Init Logic Complete")
+
+        except Exception as e:
+            logger.error(f"Init Error: {e}")
+
+        # --- MONITORING LOOP ---
         while self.running:
             try:
-                # Regular Monitoring Loop (Cycle based)
-                # This only runs AFTER initialization is done by main thread
                 history = copy.deepcopy(self.tm.get_history())
                 
-                # Wait until there is actual conversation history
                 if len(history) > 0:
                     should_run, reason = await self.trigger.check_trigger(history)
 
@@ -315,13 +359,19 @@ class TextBridgeAgent:
         except Exception:
             return None, []
 
+        turn_id = str(uuid.uuid4())
         text_accumulator = []
         
         try:
             async for response in self.session.receive():
                 if data := response.data:
                     b64_audio = base64.b64encode(data).decode('utf-8')
-                    await websocket.send_json({"type": "audio", "speaker": self.name, "data": b64_audio})
+                    await websocket.send_json({
+                        "type": "audio",
+                        "id": turn_id,
+                        "speaker": self.name,
+                        "data": b64_audio
+                    })
                     await asyncio.sleep(0.01)
 
                 if response.server_content and response.server_content.output_transcription:
@@ -339,6 +389,7 @@ class TextBridgeAgent:
 
                         await websocket.send_json({
                             "type": "transcript",
+                            "id": turn_id,
                             "speaker": self.name,
                             "text": full_text,
                             "highlights": highlights
@@ -358,13 +409,9 @@ class SimulationManager:
         self.nurse = TextBridgeAgent("NURSE", NURSE_PROMPT, "Aoede")
         self.patient = TextBridgeAgent("PATIENT", PATIENT_PROMPT, "Puck")
         
-        # Logic Agents (Instantiated here to use in Init Phase)
+        # Main Thread Logic Agents
         self.advisor = AdvisorAgent()
         self.highlighter = AnswerHighlighterAgent()
-        self.trigger = DiagnosisTriggerAgent()
-        self.diagnoser = DiagnoseAgent()
-        self.evaluator = DiagnoseEvaluatorAgent()
-        self.ranker = QuestionRankingAgent()
         
         self.tm = TranscriptManager()
         self.qm = question_manager.QuestionPoolManager(QUESTION_LIST)
@@ -381,66 +428,23 @@ class SimulationManager:
         self.running = True
         await self.websocket.send_json({"type": "system", "message": "Initializing Agents..."})
 
-        # --- INITIALIZATION PHASE ---
-        try:
-            await self.websocket.send_json({"type": "system", "message": "Running Initial Diagnosis..."})
-            logger.info("⚡ Running Initial Logic...")
-            
-            # Fake history from static profile
-            initial_history = [{"speaker": "PATIENT_INFO", "text": PATIENT_PROFILE_TEXT}]
-
-            # 1. Diagnose
-            diag_res = await self.diagnoser.get_diagnosis_update(initial_history, self.dm.get_diagnosis_basic())
-            self.dm.update_diagnoses(diag_res.get("diagnosis_list"))
-            
-            # 2. Evaluate
-            merged_diag = await self.evaluator.evaluate_diagnoses(
-                self.dm.get_consolidated_diagnoses_basic(),
-                diag_res.get("diagnosis_list"), 
-                initial_history
-            )
-            self.dm.set_consolidated_diagnoses(merged_diag)
-            
-            # 3. Questions
-            self.qm.add_questions_from_text(diag_res.get("follow_up_questions"))
-            diag_stream = self.dm.get_consolidated_diagnoses()
-            q_list = self.qm.get_recommend_question()
-            
-            # 4. Rank
-            ranked_q = await self.ranker.rank_questions(initial_history, diag_stream, q_list)
-            self.qm.update_ranking(ranked_q)
-
-            # 5. Push Updates
-            self.shared_state["ranked_questions"] = self.qm.get_recommend_question()
-            await self.websocket.send_json({"type": "diagnosis", "data": diag_stream})
-            await self.websocket.send_json({"type": "questions", "data": self.qm.get_questions()})
-            logger.info("✅ Init Logic Complete")
-
-        except Exception as e:
-            logger.error(f"Init Error: {e}")
-            await self.websocket.send_json({"type": "system", "message": "Init Error, proceeding..."})
-
-        # --- START BACKGROUND MONITORING ---
-        agents_bundle = {
-            'trigger': self.trigger, 'diagnoser': self.diagnoser,
-            'evaluator': self.evaluator, 'ranker': self.ranker
-        }
+        # Start Logic Thread (Note: We do NOT pass agents anymore, they are created inside)
         logic_thread = ClinicalLogicThread(
             self.tm, self.qm, self.dm, self.shared_state, 
-            asyncio.get_running_loop(), self.websocket, agents_bundle
+            asyncio.get_running_loop(), self.websocket
         )
         logic_thread.start()
 
-        # --- START VOICE LOOPS ---
         async with contextlib.AsyncExitStack() as stack:
             self.nurse.set_session(await stack.enter_async_context(self.nurse.get_connection_context()))
             self.patient.set_session(await stack.enter_async_context(self.patient.get_connection_context()))
             await self.websocket.send_json({"type": "system", "message": "Starting Assessment."})
 
-            next_instruction = "Introduce yourself and tell the patient will asked health condition."
+            next_instruction = "Introduce yourself and tell the patient will asked about health condition."
             patient_last_words = "Hello."
             interview_end = False
-
+            last_qid = None
+            
             while self.running:
                 self.shared_state["cycle"] = self.cycle 
 
@@ -472,6 +476,9 @@ class SimulationManager:
                     patient_text = "[The patient nods]"
                     patient_last_words = "(Silent)"
 
+                if last_qid:
+                    self.qm.update_answer(last_qid, patient_text)
+
                 self.tm.log("PATIENT", patient_text, highlight_data=highlight_result)
                 await asyncio.sleep(0.5)
 
@@ -482,7 +489,9 @@ class SimulationManager:
                     current_ranked = self.shared_state["ranked_questions"]
                     question, reasoning, status, qid = await self.advisor.get_advise(self.tm.get_history(), current_ranked)
                     
-                    if qid: self.qm.update_status(qid, "asked")
+                    if qid: 
+                        self.qm.update_status(qid, "asked")
+                        last_qid = qid
                     
                     await self.websocket.send_json({"type": "system", "message": f"Logic: {reasoning}"})
                     
@@ -491,7 +500,7 @@ class SimulationManager:
                     self.cycle += 1
 
                 except Exception as e:
-                    logger.error(f"Loop Logic Error: {e}")
+                    logger.error(f"Main Loop Logic Error: {e}")
                     next_instruction = "Continue assessment."
 
                 if self.websocket.client_state.name == "DISCONNECTED": break
