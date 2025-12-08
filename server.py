@@ -198,15 +198,18 @@ class AnswerHighlighterAgent(BaseLogicAgent):
 class TranscriptManager:
     def __init__(self):
         self.history = []
+        self._lock = threading.Lock()
     
     def log(self, speaker, text, highlight_data=None):
-        entry = {"timestamp": datetime.datetime.now().strftime("%H:%M:%S"), "speaker": speaker, "text": text.strip()}
-        if speaker == "PATIENT": entry["highlight"] = highlight_data or []
-        self.history.append(entry)
-        logger.info(f"📝 {speaker}: {text[:50]}...")
+        with self._lock:
+            entry = {"timestamp": datetime.datetime.now().strftime("%H:%M:%S"), "speaker": speaker, "text": text.strip()}
+            if speaker == "PATIENT": entry["highlight"] = highlight_data or []
+            self.history.append(entry)
+            logger.info(f"📝 {speaker}: {text[:50]}...")
     
     def get_history(self):
-        return self.history
+        with self._lock:
+            return copy.deepcopy(self.history)
 
 class ClinicalLogicThread(threading.Thread):
     def __init__(self, transcript_manager, qm, dm, shared_state, main_loop, websocket):
@@ -218,111 +221,80 @@ class ClinicalLogicThread(threading.Thread):
         self.main_loop = main_loop 
         self.websocket = websocket
         
-        # NOTE: Agents are NOT initialized here to avoid binding to the main thread's loop.
-        # They will be initialized in run() -> _monitor_loop()
-        
         self.running = True
         self.daemon = True 
+        self.last_processed_count = 0
 
     def run(self):
-        # Create a new Event Loop for this thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        # --- FIX: INITIALIZE AGENTS HERE (Inside the Thread's Loop) ---
         self.trigger = DiagnosisTriggerAgent()
         self.diagnoser = DiagnoseAgent()
         self.evaluator = DiagnoseEvaluatorAgent()
         self.ranker = QuestionRankingAgent()
 
-        logger.info("🩺 Logic Thread Started (Agents Initialized)")
+        logger.info("🩺 Logic Thread Started")
         loop.run_until_complete(self._monitor_loop())
 
     async def _push_update(self, type_str, data):
         if self.websocket and self.main_loop and not self.websocket.client_state.name == "DISCONNECTED":
-            future = asyncio.run_coroutine_threadsafe(
-                self.websocket.send_json({"type": type_str, "data": data}),
-                self.main_loop
-            )
             try:
-                future.result(timeout=1) 
-            except:
+                future = asyncio.run_coroutine_threadsafe(
+                    self.websocket.send_json({"type": type_str, "data": data}),
+                    self.main_loop
+                )
+                future.result(timeout=1)
+            except Exception:
                 pass
 
     async def _monitor_loop(self):
-        # --- INITIALIZATION PHASE ---
-        try:
-            logger.info("⚡ Running Initial Diagnosis (Thread)...")
-            initial_history = [{"speaker": "PATIENT_INFO", "text": PATIENT_PROFILE_TEXT}]
-
-            # 1. Diagnose
-            diag_res = await self.diagnoser.get_diagnosis_update(initial_history, self.dm.get_diagnosis_basic())
-            self.dm.update_diagnoses(diag_res.get("diagnosis_list"))
-            
-            # 2. Evaluate
-            merged_diag = await self.evaluator.evaluate_diagnoses(
-                self.dm.get_consolidated_diagnoses_basic(),
-                diag_res.get("diagnosis_list"), 
-                initial_history
-            )
-            self.dm.set_consolidated_diagnoses(merged_diag)
-            
-            # 3. Questions
-            self.qm.add_questions_from_text(diag_res.get("follow_up_questions"))
-            diag_stream = self.dm.get_consolidated_diagnoses()
-            q_list = self.qm.get_recommend_question()
-            
-            # 4. Rank
-            ranked_q = await self.ranker.rank_questions(initial_history, diag_stream, q_list)
-            self.qm.update_ranking(ranked_q)
-
-            # 5. Push Updates
-            await self._push_update("diagnosis", diag_stream)
-            await self._push_update("questions", self.qm.get_questions())
-            
-            self.shared_state["ranked_questions"] = self.qm.get_recommend_question()
-            logger.info("✅ Init Logic Complete")
-
-        except Exception as e:
-            logger.error(f"Init Error: {e}")
-
-        # --- MONITORING LOOP ---
+        # NOTE: Initial Logic removed from here. It is now in SimulationManager.run()
         while self.running:
             try:
-                history = copy.deepcopy(self.tm.get_history())
-                
-                if len(history) > 0:
-                    should_run, reason = await self.trigger.check_trigger(history)
+                history = self.tm.get_history()
+                current_len = len(history)
 
-                    if should_run:
-                        logger.info(f"⚡ Diagnosis Triggered: {reason}")
-                        
-                        diag_res = await self.diagnoser.get_diagnosis_update(history, self.dm.get_diagnosis_basic())
-                        self.dm.update_diagnoses(diag_res.get("diagnosis_list"))
-                        
-                        merged_diag = await self.evaluator.evaluate_diagnoses(
-                            self.dm.get_consolidated_diagnoses_basic(),
-                            diag_res.get("diagnosis_list"), 
-                            history
-                        )
-                        self.dm.set_consolidated_diagnoses(merged_diag)
-                        
-                        self.qm.add_questions_from_text(diag_res.get("follow_up_questions"))
-                        diag_stream = self.dm.get_consolidated_diagnoses()
-                        q_list = self.qm.get_recommend_question()
-                        
-                        ranked_q = await self.ranker.rank_questions(history, diag_stream, q_list)
-                        self.qm.update_ranking(ranked_q)
+                # TRIGGER CONDITION: Has history grown?
+                if current_len > self.last_processed_count:
+                    
+                    logger.info(f"⚡ New Transcript Detected ({current_len} turns). Running Logic...")
+                    
+                    # 1. Diagnose
+                    diag_res = await self.diagnoser.get_diagnosis_update(history, self.dm.get_diagnosis_basic())
+                    self.dm.update_diagnoses(diag_res.get("diagnosis_list"))
+                    
+                    # 2. Evaluate
+                    merged_diag = await self.evaluator.evaluate_diagnoses(
+                        self.dm.get_consolidated_diagnoses_basic(),
+                        diag_res.get("diagnosis_list"), 
+                        history
+                    )
+                    self.dm.set_consolidated_diagnoses(merged_diag)
+                    
+                    # 3. Questions
+                    self.qm.add_questions_from_text(diag_res.get("follow_up_questions"))
+                    
+                    # 4. Rank
+                    diag_stream = self.dm.get_consolidated_diagnoses()
+                    q_list = self.qm.get_recommend_question()
+                    ranked_q = await self.ranker.rank_questions(history, diag_stream, q_list)
+                    self.qm.update_ranking(ranked_q)
 
-                        await self._push_update("diagnosis", diag_stream)
-                        await self._push_update("questions", self.qm.get_questions())
-                        
-                        self.shared_state["ranked_questions"] = self.qm.get_recommend_question()
-                        
+                    # 5. Push
+                    await self._push_update("diagnosis", diag_stream)
+                    await self._push_update("questions", self.qm.get_questions())
+                    
+                    self.shared_state["ranked_questions"] = self.qm.get_recommend_question()
+                    
+                    # Update checkpoint
+                    self.last_processed_count = current_len
+                    logger.info("✅ Logic Cycle Complete")
+
             except Exception as e:
                 logger.error(f"Logic Thread Error: {e}")
             
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
     def stop(self):
         self.running = False
@@ -366,12 +338,7 @@ class TextBridgeAgent:
             async for response in self.session.receive():
                 if data := response.data:
                     b64_audio = base64.b64encode(data).decode('utf-8')
-                    await websocket.send_json({
-                        "type": "audio",
-                        "id": turn_id,
-                        "speaker": self.name,
-                        "data": b64_audio
-                    })
+                    await websocket.send_json({"type": "audio", "id": turn_id, "speaker": self.name, "data": b64_audio})
                     await asyncio.sleep(0.01)
 
                 if response.server_content and response.server_content.output_transcription:
@@ -409,9 +376,12 @@ class SimulationManager:
         self.nurse = TextBridgeAgent("NURSE", NURSE_PROMPT, "Aoede")
         self.patient = TextBridgeAgent("PATIENT", PATIENT_PROMPT, "Puck")
         
-        # Main Thread Logic Agents
+        # Logic Agents (Instantiated here for Init phase)
         self.advisor = AdvisorAgent()
         self.highlighter = AnswerHighlighterAgent()
+        self.diagnoser = DiagnoseAgent()
+        self.evaluator = DiagnoseEvaluatorAgent()
+        self.ranker = QuestionRankingAgent()
         
         self.tm = TranscriptManager()
         self.qm = question_manager.QuestionPoolManager(QUESTION_LIST)
@@ -428,19 +398,57 @@ class SimulationManager:
         self.running = True
         await self.websocket.send_json({"type": "system", "message": "Initializing Agents..."})
 
-        # Start Logic Thread (Note: We do NOT pass agents anymore, they are created inside)
+        # --- INITIALIZATION PHASE (Running on Main Thread BEFORE loop) ---
+        try:
+            logger.info("⚡ Running Initial Diagnosis (Main Thread)...")
+            initial_history = [{"speaker": "PATIENT_INFO", "text": PATIENT_PROFILE_TEXT}]
+
+            # 1. Diagnose
+            diag_res = await self.diagnoser.get_diagnosis_update(initial_history, self.dm.get_diagnosis_basic())
+            self.dm.update_diagnoses(diag_res.get("diagnosis_list"))
+            
+            # 2. Evaluate
+            merged_diag = await self.evaluator.evaluate_diagnoses(
+                self.dm.get_consolidated_diagnoses_basic(),
+                diag_res.get("diagnosis_list"), 
+                initial_history
+            )
+            self.dm.set_consolidated_diagnoses(merged_diag)
+            
+            # 3. Questions
+            self.qm.add_questions_from_text(diag_res.get("follow_up_questions"))
+            diag_stream = self.dm.get_consolidated_diagnoses()
+            q_list = self.qm.get_recommend_question()
+            
+            # 4. Rank
+            ranked_q = await self.ranker.rank_questions(initial_history, diag_stream, q_list)
+            self.qm.update_ranking(ranked_q)
+
+            # 5. Push Updates
+            self.shared_state["ranked_questions"] = self.qm.get_recommend_question()
+            await self.websocket.send_json({"type": "diagnosis", "data": diag_stream})
+            await self.websocket.send_json({"type": "questions", "data": self.qm.get_questions()})
+            
+            logger.info("✅ Init Logic Complete")
+
+        except Exception as e:
+            logger.error(f"Init Error: {e}")
+            await self.websocket.send_json({"type": "system", "message": "Init Error, proceeding..."})
+
+        # --- START BACKGROUND MONITORING ---
         logic_thread = ClinicalLogicThread(
             self.tm, self.qm, self.dm, self.shared_state, 
             asyncio.get_running_loop(), self.websocket
         )
         logic_thread.start()
 
+        # --- START VOICE LOOPS ---
         async with contextlib.AsyncExitStack() as stack:
             self.nurse.set_session(await stack.enter_async_context(self.nurse.get_connection_context()))
             self.patient.set_session(await stack.enter_async_context(self.patient.get_connection_context()))
             await self.websocket.send_json({"type": "system", "message": "Starting Assessment."})
 
-            next_instruction = "Introduce yourself and tell the patient will asked about health condition."
+            next_instruction = "Introduce yourself and ask for Name and DOB."
             patient_last_words = "Hello."
             interview_end = False
             last_qid = None
@@ -455,11 +463,8 @@ class SimulationManager:
                 if not nurse_text: nurse_text = "[The nurse waits]"
                 self.tm.log("NURSE", nurse_text)
 
-                if "doctor" in next_instruction.lower() and "bye" in nurse_text.lower():
-                    await self.websocket.send_json({"type": "system", "message": "Ended by Protocol."})
-                    break
-
                 await asyncio.sleep(0.5)
+                await self.websocket.send_json({"type": "questions", "data": self.qm.get_questions()})
 
                 # --- 2. PATIENT ---
                 current_diagnosis_context = self.dm.get_consolidated_diagnoses_basic()
@@ -478,10 +483,11 @@ class SimulationManager:
 
                 if last_qid:
                     self.qm.update_answer(last_qid, patient_text)
+                    await self.websocket.send_json({"type": "questions", "data": self.qm.get_questions()})
 
                 self.tm.log("PATIENT", patient_text, highlight_data=highlight_result)
                 await asyncio.sleep(0.5)
-
+                await self.websocket.send_json({"type": "turn", "data": "finish cycle"})
                 if interview_end: break
 
                 # --- 3. ADVISOR ---
@@ -504,6 +510,8 @@ class SimulationManager:
                     next_instruction = "Continue assessment."
 
                 if self.websocket.client_state.name == "DISCONNECTED": break
+
+            await self.websocket.send_json({"type": "turn", "data": "end"})
 
         logic_thread.stop()
 
