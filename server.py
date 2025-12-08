@@ -384,7 +384,7 @@ class SimulationManager:
         self.ranker = QuestionRankingAgent()
         
         self.tm = TranscriptManager()
-        self.qm = question_manager.QuestionPoolManager(QUESTION_LIST)
+        self.qm = question_manager.QuestionPoolManager(copy.deepcopy(QUESTION_LIST))
         self.dm = diagnosis_manager.DiagnosisManager()
         
         self.cycle = 0
