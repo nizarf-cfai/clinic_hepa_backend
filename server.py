@@ -20,10 +20,17 @@ import diagnosis_manager
 
 import google.auth.transport.requests
 import google.auth.transport.grpc 
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException # Add HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel # Add Pydantic for request body
+from google.cloud import storage # Add Storage Client
+from fastapi.responses import JSONResponse, Response
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("medforce-backend")
+
 
 load_dotenv()
 
@@ -36,6 +43,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class PatientFileRequest(BaseModel):
+    pid: str       # e.g., "p001"
+    file_name: str # e.g., "lab_results.png" or "history.md"
+
 
 # --- Configuration ---
 VOICE_MODEL = "gemini-live-2.5-flash-preview-native-audio-09-2025"
@@ -526,3 +539,63 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.running = False
         if hasattr(manager, 'logic_thread'): manager.logic_thread.stop()
+
+
+@app.post("/api/get-patient-file")
+def get_patient_file(request: PatientFileRequest):
+    """
+    Retrieves a file from gs://clinic_sim/patient_profile/{pid}/{file_name}
+    Handles JSON, Markdown, and PNG content types.
+    """
+    BUCKET_NAME = "clinic_sim"
+    blob_path = f"patient_profile/{request.pid}/{request.file_name}"
+    
+    logger.info(f"📥 Fetching GCS: gs://{BUCKET_NAME}/{blob_path}")
+
+    try:
+        # Initialize GCS Client (Auth is automatic in Cloud Run)
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blob = bucket.blob(blob_path)
+
+        if not blob.exists():
+            logger.warning(f"File not found: {blob_path}")
+            # Return 404 but as JSON so frontend handles it gracefully
+            return JSONResponse(
+                status_code=404, 
+                content={"error": "File not found", "path": blob_path}
+            )
+
+        # Determine file type based on extension
+        file_ext = request.file_name.lower().split('.')[-1]
+
+        # --- HANDLE JSON ---
+        if file_ext == 'json':
+            content = blob.download_as_text()
+            return JSONResponse(content=json.loads(content))
+
+        # --- HANDLE MARKDOWN / TEXT ---
+        elif file_ext in ['md', 'txt']:
+            content = blob.download_as_text()
+            return Response(content=content, media_type="text/markdown")
+
+        # --- HANDLE IMAGES (PNG/JPG) ---
+        elif file_ext in ['png', 'jpg', 'jpeg']:
+            content = blob.download_as_bytes()
+            media_type = "image/png" if file_ext == 'png' else "image/jpeg"
+            return Response(content=content, media_type=media_type)
+
+        # --- FALLBACK ---
+        else:
+            # Default to binary stream for unknown types
+            content = blob.download_as_bytes()
+            return Response(content=content, media_type="application/octet-stream")
+
+    except Exception as e:
+        logger.error(f"GCS API Error: {e}")
+        return JSONResponse(
+            status_code=500, 
+            content={"error": str(e)}
+        )
+    
+
