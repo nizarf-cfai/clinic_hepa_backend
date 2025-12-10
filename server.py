@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-
+import traceback
 # --- Local Modules ---
 import question_manager
 import diagnosis_manager
@@ -56,31 +56,42 @@ ADVISOR_MODEL = "gemini-2.5-flash-lite"
 DIAGNOSER_MODEL = "gemini-2.5-flash-lite" 
 RANKER_MODEL = "gemini-2.5-flash-lite" 
 
+
+
+def fetch_gcs_text_internal(pid: str, filename: str) -> str:
+    """Fetches text content from GCS for internal logic use."""
+    BUCKET_NAME = "clinic_sim"
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blob_path = f"patient_profile/{pid}/{filename}"
+        blob = bucket.blob(blob_path)
+        
+        if not blob.exists():
+            logger.warning(f"File not found in GCS: {blob_path}")
+            return f"System: Error - File {filename} not found."
+            
+        return blob.download_as_text()
+    except Exception as e:
+        logger.error(f"GCS Internal Error: {e}")
+        return "System: Error loading profile."
 # --- LOAD STATIC DATA ---
 try:
     with open("questions.json", 'r') as file:
         QUESTION_LIST = json.load(file)
-    with open("patient_profile/arthur_info.md", "r", encoding="utf-8") as f:
-        PATIENT_PROFILE_TEXT = f.read()
+    # with open("patient_profile/arthur_info.md", "r", encoding="utf-8") as f:
+    #     PATIENT_PROFILE_TEXT = f.read()
     with open("patient_profile/nurse.md", "r", encoding="utf-8") as f:
         NURSE_PROMPT = f.read()
-    with open("patient_profile/arthur.md", "r", encoding="utf-8") as f:
-        PATIENT_PROMPT = f.read()
-    
-    COMPLETION_CHECKLIST = [
-        "Chief Complaint identified",
-        "Pain Level (severity) quantified",
-        "Duration of symptoms established",
-        "Current Medications listed",
-        "Drug Allergies listed",
-        "Past Surgeries listed"
-    ]
+    # with open("patient_profile/arthur.md", "r", encoding="utf-8") as f:
+    #     PATIENT_PROMPT = f.read()
+
 except Exception as e:
     logger.error(f"Failed to load static files: {e}")
     QUESTION_LIST = []
-    PATIENT_PROFILE_TEXT = ""
+    # PATIENT_PROFILE_TEXT = ""
     NURSE_PROMPT = "You are a nurse."
-    PATIENT_PROMPT = "You are a patient."
+    # PATIENT_PROMPT = "You are a patient."
 
 # ==========================================
 # LOGIC AGENTS
@@ -91,15 +102,16 @@ class BaseLogicAgent:
         self.client = genai.Client(vertexai=True, project=os.getenv("PROJECT_ID"), location=os.getenv("PROJECT_LOCATION", "us-central1"))
 
 class QuestionRankingAgent(BaseLogicAgent):
-    def __init__(self):
+    def __init__(self,patient_info):
         super().__init__()
         self.response_schema = {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"rank": { "type": "INTEGER" }, "qid": { "type": "STRING" }}, "required": ["rank", "qid"]}}
+        self.patient_info = patient_info
         try:
             with open("patient_profile/q_ranker.md", "r", encoding="utf-8") as f: self.system_instruction = f.read()
         except: self.system_instruction = "Rank by priority."
 
     async def rank_questions(self, conversation_history, current_diagnosis, q_list):
-        prompt = f"Patient Profile:\n{PATIENT_PROFILE_TEXT}\n\nHistory:\n{json.dumps(conversation_history)}\n\nDiagnosis:\n{json.dumps(current_diagnosis)}\n\nQuestions:\n{json.dumps(q_list)}"
+        prompt = f"Patient Profile:\n{self.patient_info}\n\nHistory:\n{json.dumps(conversation_history)}\n\nDiagnosis:\n{json.dumps(current_diagnosis)}\n\nQuestions:\n{json.dumps(q_list)}"
         try:
             response = await self.client.aio.models.generate_content(
                 model=RANKER_MODEL, contents=prompt,
@@ -148,15 +160,16 @@ class DiagnoseEvaluatorAgent(BaseLogicAgent):
         except: return diagnosis_pool + new_diagnosis_list
 
 class DiagnoseAgent(BaseLogicAgent):
-    def __init__(self):
+    def __init__(self, patient_info):
         super().__init__()
         self.response_schema = {"type": "OBJECT", "properties": {"diagnosis_list": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"diagnosis": { "type": "STRING" }, "did": { "type": "STRING" }, "indicators_point": { "type": "ARRAY", "items": { "type": "STRING" } }}, "required": ["diagnosis", "indicators_point", "did"]}}, "follow_up_questions": {"type": "ARRAY", "items": { "type": "STRING" }}}, "required": ["diagnosis_list", "follow_up_questions"]}
+        self.patient_info = patient_info
         try:
             with open("patient_profile/diagnoser.md", "r", encoding="utf-8") as f: self.system_instruction = f.read()
         except: self.system_instruction = "Diagnose patient."
 
     async def get_diagnosis_update(self, interview_data, current_diagnosis_hypothesis):
-        prompt = f"Patient:\n{PATIENT_PROFILE_TEXT}\n\nTranscript:\n{json.dumps(interview_data)}\n\nState:\n{json.dumps(current_diagnosis_hypothesis)}"
+        prompt = f"Patient:\n{self.patient_info}\n\nTranscript:\n{json.dumps(interview_data)}\n\nState:\n{json.dumps(current_diagnosis_hypothesis)}"
         try:
             response = await self.client.aio.models.generate_content(
                 model=DIAGNOSER_MODEL, contents=prompt,
@@ -167,15 +180,16 @@ class DiagnoseAgent(BaseLogicAgent):
         except: return {"diagnosis_list": current_diagnosis_hypothesis, "follow_up_questions": []}
 
 class AdvisorAgent(BaseLogicAgent):
-    def __init__(self):
+    def __init__(self, patient_info):
         super().__init__()
         self.response_schema = {"type": "OBJECT", "properties": {"question": { "type": "STRING" }, "qid": { "type": "STRING" }, "end_conversation": { "type": "BOOLEAN" }, "reasoning": { "type": "STRING" }}, "required": ["question", "end_conversation", "reasoning", "qid"]}
+        self.patient_info = patient_info
         try:
             with open("patient_profile/advisor_agent.md", "r", encoding="utf-8") as f: self.system_instruction = f.read()
         except: self.system_instruction = "Advise nurse."
 
     async def get_advise(self, conversation_history, q_list):
-        prompt = f"Context:\n{PATIENT_PROFILE_TEXT}\n\nHistory:\n{json.dumps(conversation_history)}\n\nChecklist:\n{json.dumps(COMPLETION_CHECKLIST)}\n\nQuestions:\n{json.dumps(q_list)}"
+        prompt = f"Context:\n{self.patient_info}\n\nHistory:\n{json.dumps(conversation_history)}\n\nQuestions:\n{json.dumps(q_list)}"
         try:
             response = await self.client.aio.models.generate_content(
                 model=ADVISOR_MODEL, contents=prompt,
@@ -243,9 +257,9 @@ class ClinicalLogicThread(threading.Thread):
         asyncio.set_event_loop(loop)
         
         self.trigger = DiagnosisTriggerAgent()
-        self.diagnoser = DiagnoseAgent()
+        self.diagnoser = DiagnoseAgent(patient_info=self.shared_state.get('patient_info'))
         self.evaluator = DiagnoseEvaluatorAgent()
-        self.ranker = QuestionRankingAgent()
+        self.ranker = QuestionRankingAgent(patient_info=self.shared_state.get('patient_info'))
 
         logger.info("🩺 Logic Thread Started")
         loop.run_until_complete(self._monitor_loop())
@@ -321,14 +335,22 @@ class TextBridgeAgent:
         self.name = name
         self.system_instruction = system_instruction
         self.voice_name = voice_name
-        self.client = genai.Client(vertexai=True, project=os.getenv("PROJECT_ID"), location=os.getenv("PROJECT_LOCATION", "us-central1"))
+        self.client = genai.Client(
+            vertexai=True, 
+            project=os.getenv("PROJECT_ID"), 
+            location=os.getenv("PROJECT_LOCATION", "us-central1")
+        )
         self.session = None
 
     def get_connection_context(self):
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"], 
             system_instruction=types.Content(parts=[types.Part(text=self.system_instruction)]),
-            speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self.voice_name))),
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=self.voice_name)
+                )
+            ),
             output_audio_transcription=types.AudioTranscriptionConfig(),
         )
         return self.client.aio.live.connect(model=VOICE_MODEL, config=config)
@@ -344,21 +366,48 @@ class TextBridgeAgent:
         except Exception:
             return None, []
 
+        # Generate a UUID for this specific turn so frontend knows which text belongs to which audio
         turn_id = str(uuid.uuid4())
         text_accumulator = []
         
         try:
             async for response in self.session.receive():
+                # 1. AUDIO STREAMING
                 if data := response.data:
                     b64_audio = base64.b64encode(data).decode('utf-8')
-                    await websocket.send_json({"type": "audio", "id": turn_id, "speaker": self.name, "data": b64_audio})
-                    await asyncio.sleep(0.01)
+                    await websocket.send_json({
+                        "type": "audio",
+                        "id": turn_id,
+                        "speaker": self.name,
+                        "data": b64_audio
+                    })
+                    # Tiny yield to allow event loop to handle other websocket traffic
+                    await asyncio.sleep(0.005) 
 
+                # 2. TEXT STREAMING (REAL-TIME)
                 if response.server_content and response.server_content.output_transcription:
-                    if text := response.server_content.output_transcription.text:
-                        text_accumulator.append(text)
+                    if text_chunk := response.server_content.output_transcription.text:
+                        # Accumulate for logic processing later
+                        text_accumulator.append(text_chunk)
+                        
+                        # Send DELTA immediately to frontend
+                        await websocket.send_json({
+                            "type": "text_delta",
+                            "id": turn_id,
+                            "speaker": self.name,
+                            "text": text_chunk,
+                        })
 
+                # 3. TURN COMPLETE
                 if response.server_content and response.server_content.turn_complete:
+                    # Notify frontend audio is done streaming for this turn
+                    await websocket.send_json({
+                        "type": "turn_complete",
+                        "id": turn_id,
+                        "speaker": self.name
+                    })
+                    
+                    # Process full text for Logic Agents (Highlights, Diagnosis, etc.)
                     full_text = "".join(text_accumulator).strip()
                     if full_text:
                         highlights = []
@@ -367,6 +416,8 @@ class TextBridgeAgent:
                                 highlights = await highlighter.highlight_text(full_text, diagnosis_context)
                             except: pass
 
+                        # Send the "Finalized" transcript with highlights
+                        # The frontend can replace the streamed text with this rich version
                         await websocket.send_json({
                             "type": "transcript",
                             "id": turn_id,
@@ -376,25 +427,28 @@ class TextBridgeAgent:
                         })
                         return full_text, highlights
                     return "[...]", []
+                    
             return None, []
         except Exception as e:
             logger.error(f"Stream Error ({self.name}): {e}")
             return None, []
-
 class SimulationManager:
-    def __init__(self, websocket: WebSocket):
+    def __init__(self, websocket: WebSocket, patient_id: str):
         self.websocket = websocket
         
+        self.PATIENT_PROMPT = fetch_gcs_text_internal(patient_id, "patient_system.md")
+        self.PATIENT_INFO = fetch_gcs_text_internal(patient_id, "patient_info.md")
+
         # Voice Agents
         self.nurse = TextBridgeAgent("NURSE", NURSE_PROMPT, "Aoede")
-        self.patient = TextBridgeAgent("PATIENT", PATIENT_PROMPT, "Puck")
+        self.patient = TextBridgeAgent("PATIENT", self.PATIENT_PROMPT, "Puck")
         
         # Logic Agents (Instantiated here for Init phase)
-        self.advisor = AdvisorAgent()
+        self.advisor = AdvisorAgent(patient_info=self.PATIENT_INFO)
         self.highlighter = AnswerHighlighterAgent()
-        self.diagnoser = DiagnoseAgent()
+        self.diagnoser = DiagnoseAgent(patient_info=self.PATIENT_INFO)
         self.evaluator = DiagnoseEvaluatorAgent()
-        self.ranker = QuestionRankingAgent()
+        self.ranker = QuestionRankingAgent(patient_info=self.PATIENT_INFO)
         
         self.tm = TranscriptManager()
         self.qm = question_manager.QuestionPoolManager(copy.deepcopy(QUESTION_LIST))
@@ -403,7 +457,8 @@ class SimulationManager:
         self.cycle = 0
         self.shared_state = {
             "ranked_questions": self.qm.get_recommend_question(),
-            "cycle": 0
+            "cycle": 0,
+            "patient_info" : self.PATIENT_INFO
         }
         self.running = False
 
@@ -414,7 +469,7 @@ class SimulationManager:
         # --- INITIALIZATION PHASE (Running on Main Thread BEFORE loop) ---
         try:
             logger.info("⚡ Running Initial Diagnosis (Main Thread)...")
-            initial_history = [{"speaker": "PATIENT_INFO", "text": PATIENT_PROFILE_TEXT}]
+            initial_history = [{"speaker": "PATIENT_INFO", "text": self.PATIENT_INFO}]
 
             # 1. Diagnose
             diag_res = await self.diagnoser.get_diagnosis_update(initial_history, self.dm.get_diagnosis_basic())
@@ -461,7 +516,10 @@ class SimulationManager:
             self.patient.set_session(await stack.enter_async_context(self.patient.get_connection_context()))
             await self.websocket.send_json({"type": "system", "message": "Starting Assessment."})
 
-            next_instruction = "Introduce yourself and ask for Name and DOB."
+
+
+
+            next_instruction = "Intoduce yourself and tell the patient you have patient data and will asked further question for detailed health condition."
             patient_last_words = "Hello."
             interview_end = False
             last_qid = None
@@ -531,14 +589,35 @@ class SimulationManager:
 @app.websocket("/ws/simulation")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    manager = SimulationManager(websocket)
+    
+    # We declare manager outside try block so we can access it in except for cleanup
+    manager = None 
+    
     try:
-        data = await websocket.receive_text()
-        if data == "start":
+        # 1. WAIT FOR HANDSHAKE PAYLOAD (JSON only)
+        # Frontend sends: { "type": "start", "patient_id": "P0001" }
+        data = await websocket.receive_json()
+
+        if isinstance(data, dict) and data.get("type") == "start":
+            patient_id = data.get("patient_id", "P0001") # Default fallback
+            
+            # 2. INSTANTIATE WITH ID
+            manager = SimulationManager(websocket, patient_id)
+            
+            # 3. RUN
             await manager.run()
+            
     except WebSocketDisconnect:
-        manager.running = False
-        if hasattr(manager, 'logic_thread'): manager.logic_thread.stop()
+        logger.info("Client disconnected")
+        if manager:
+            manager.running = False
+            if hasattr(manager, 'logic_thread'): 
+                manager.logic_thread.stop()
+    except Exception as e:
+        traceback.print_exc()
+        logger.error(f"WebSocket Error: {e}")
+        if manager:
+            manager.running = False
 
 
 @app.post("/api/get-patient-file")
