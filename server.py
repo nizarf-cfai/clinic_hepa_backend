@@ -433,7 +433,7 @@ class TextBridgeAgent:
             logger.error(f"Stream Error ({self.name}): {e}")
             return None, []
 class SimulationManager:
-    def __init__(self, websocket: WebSocket, patient_id: str):
+    def __init__(self, websocket: WebSocket, patient_id: str, gender:str = "Male"):
         self.websocket = websocket
         
         self.PATIENT_PROMPT = fetch_gcs_text_internal(patient_id, "patient_system.md")
@@ -441,7 +441,11 @@ class SimulationManager:
 
         # Voice Agents
         self.nurse = TextBridgeAgent("NURSE", NURSE_PROMPT, "Aoede")
-        self.patient = TextBridgeAgent("PATIENT", self.PATIENT_PROMPT, "Puck")
+        if gender == "Male":
+            self.patient = TextBridgeAgent("PATIENT", self.PATIENT_PROMPT, "Puck")
+        else:
+            self.patient = TextBridgeAgent("PATIENT", self.PATIENT_PROMPT, "Laomedeia")
+
         
         # Logic Agents (Instantiated here for Init phase)
         self.advisor = AdvisorAgent(patient_info=self.PATIENT_INFO)
@@ -600,9 +604,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
         if isinstance(data, dict) and data.get("type") == "start":
             patient_id = data.get("patient_id", "P0001") # Default fallback
+            gender = data.get("gender") # New field, optional for now
             
             # 2. INSTANTIATE WITH ID
-            manager = SimulationManager(websocket, patient_id)
+            manager = SimulationManager(websocket, patient_id, gender)
             
             # 3. RUN
             await manager.run()
