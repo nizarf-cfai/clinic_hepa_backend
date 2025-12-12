@@ -52,7 +52,7 @@ class PatientFileRequest(BaseModel):
 
 # --- Configuration ---
 VOICE_MODEL = "gemini-live-2.5-flash-preview-native-audio-09-2025"
-ADVISOR_MODEL = "gemini-2.5-flash-lite" 
+ADVISOR_MODEL = "gemini-2.5-flash" 
 DIAGNOSER_MODEL = "gemini-2.5-flash-lite" 
 RANKER_MODEL = "gemini-2.5-flash-lite" 
 
